@@ -1,62 +1,45 @@
 import logging
 from importlib.metadata import PackageNotFoundError, version
-from typing import Optional
+from typing import Optional, List, Union
 from warnings import warn
 
 import botocore
-import pydantic
-from pydantic_core import from_json
 from httpx import AsyncClient, ReadTimeout
 from pycognito import Cognito
-from pydantic import HttpUrl, ValidationError
 from tenacity import retry, retry_if_not_exception_type, wait_random_exponential
+from urllib.parse import urlparse
 
 from evnex.errors import NotAuthorizedException
-from evnex.schema.charge_points import (
-    EvnexChargePoint,
-    EvnexChargePointDetail,
-    EvnexChargePointLoadSchedule,
-    EvnexChargePointOverrideConfig,
-    EvnexChargePointSolarConfig,
-    EvnexChargeProfileSegment,
-    EvnexChargePointTransaction,
-    EvnexGetChargePointTransactionsResponse,
-    EvnexGetChargePointDetailResponse,
-    EvnexGetChargePointsResponse,
-)
-from evnex.schema.commands import EvnexCommandResponse
-from evnex.schema.org import EvnexGetOrgInsightResponse, EvnexOrgInsightEntry
-from evnex.schema.user import EvnexGetUserResponse, EvnexUserDetail
-from evnex.schema.v3.charge_points import (
-    EvnexChargePointDetail as EvnexChargePointDetailV3,
-    EvnexGetChargePointSessionsResponse,
-    EvnexChargePointSession,
-)
-from evnex.schema.v3.commands import EvnexCommandResponse as EvnexCommandResponseV3
-from evnex.schema.v3.generic import EvnexV3APIResponse
-from pydantic_settings import BaseSettings
 
 logger = logging.getLogger("evnex.api")
 
+def validate_http_url(value: str) -> None:
+    result = urlparse(value)
+    if not all([result.scheme, result.netloc]):
+        raise ValueError(f"Invalid URL: {value}")
 
-class EvnexConfig(BaseSettings):
-    EVNEX_BASE_URL: HttpUrl = "https://client-api.evnex.io"
-    EVNEX_COGNITO_USER_POOL_ID: str = "ap-southeast-2_zWnqo6ASv"
-    EVNEX_COGNITO_CLIENT_ID: str = "rol3lsv2vg41783550i18r7vi"
-    EVNEX_ORG_ID: str | None = None
+class EvnexConfig:
+    def __init__(self,
+                 EVNEX_BASE_URL: str = "https://client-api.evnex.io",
+                 EVNEX_COGNITO_USER_POOL_ID: str = "ap-southeast-2_zWnqo6ASv",
+                 EVNEX_COGNITO_CLIENT_ID: str = "rol3lsv2vg41783550i18r7vi",
+                 EVNEX_ORG_ID: Optional[str] = None):
+        validate_http_url(EVNEX_BASE_URL)
+        self.EVNEX_BASE_URL = EVNEX_BASE_URL
+        self.EVNEX_COGNITO_USER_POOL_ID = EVNEX_COGNITO_USER_POOL_ID
+        self.EVNEX_COGNITO_CLIENT_ID = EVNEX_COGNITO_CLIENT_ID
+        self.EVNEX_ORG_ID = EVNEX_ORG_ID
 
 
 class Evnex:
-    def __init__(
-        self,
-        username: str,
-        password: str,
-        id_token=None,
-        refresh_token=None,
-        access_token=None,
-        config: EvnexConfig = None,
-        httpx_client: AsyncClient = None,
-    ):
+    def __init__(self,
+                 username: str,
+                 password: str,
+                 id_token=None,
+                 refresh_token=None,
+                 access_token=None,
+                 config: EvnexConfig = None,
+                 httpx_client: AsyncClient = None):
         """
         Create an Evnex API client.
 
@@ -129,18 +112,18 @@ class Evnex:
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException)),
     )
-    async def get_user_detail(self) -> EvnexUserDetail:
+    async def get_user_detail(self):
         response = await self.httpx_client.get(
             "https://client-api.evnex.io/v2/apps/user", headers=self._common_headers
         )
         response_json = await self._check_api_response(response)
-        data = EvnexGetUserResponse.model_validate(response_json).data
+        data = response_json['data']
 
         # Make the assumption that most end users are only in one org
-        if len(data.organisations):
-            self.org_id = data.organisations[0].id
+        if len(data['organisations']):
+            self.org_id = data['organisations'][0]['id']
 
         return data
 
@@ -159,8 +142,8 @@ class Evnex:
         response.raise_for_status()
 
         try:
-            return from_json(response.text)
-        except:
+            return response.json()
+        except ValueError:
             logger.debug(
                 f"Invalid json response.\n{response.status_code}\n{response.text}"
             )
@@ -168,11 +151,9 @@ class Evnex:
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException)),
     )
-    async def get_org_charge_points(
-        self, org_id: Optional[str] = None
-    ) -> list[EvnexChargePoint]:
+    async def get_org_charge_points(self, org_id: Optional[str] = None) -> list:
         if org_id is None and self.org_id:
             org_id = self.org_id
         logger.debug("Listing org charge points")
@@ -181,15 +162,13 @@ class Evnex:
             headers=self._common_headers,
         )
         json_data = await self._check_api_response(r)
-        return EvnexGetChargePointsResponse.model_validate(json_data).data.items
+        return json_data['data']['items']
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException)),
     )
-    async def get_org_insight(
-        self, days: int, org_id: Optional[str] = None
-    ) -> list[EvnexOrgInsightEntry]:
+    async def get_org_insight(self, days: int, org_id: Optional[str] = None) -> list:
         if org_id is None and self.org_id:
             org_id = self.org_id
         logger.debug("Getting org insight")
@@ -199,15 +178,13 @@ class Evnex:
             params={"days": days},
         )
         json_data = await self._check_api_response(r)
-        return EvnexGetOrgInsightResponse.model_validate(json_data).data.items
+        return json_data['data']['items']
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException)),
     )
-    async def get_charge_point_detail(
-        self, charge_point_id: str
-    ) -> EvnexChargePointDetail:
+    async def get_charge_point_detail(self, charge_point_id: str):
         warn(
             "This method is deprecated. See get_charge_point_detail_v3",
             DeprecationWarning,
@@ -218,17 +195,15 @@ class Evnex:
             headers=self._common_headers,
         )
         json_data = await self._check_api_response(r)
-        return EvnexGetChargePointDetailResponse.model_validate(json_data).data
+        return json_data['data']
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
         retry=retry_if_not_exception_type(
-            (TypeError, ValidationError, NotAuthorizedException)
+            (TypeError, ValueError, NotAuthorizedException)
         ),
     )
-    async def get_charge_point_detail_v3(
-        self, charge_point_id: str
-    ) -> EvnexV3APIResponse[EvnexChargePointDetailV3]:
+    async def get_charge_point_detail_v3(self, charge_point_id: str):
         r = await self.httpx_client.get(
             f"https://client-api.evnex.io/v3/charge-points/{charge_point_id}",
             headers=self._common_headers,
@@ -237,16 +212,13 @@ class Evnex:
             f"Raw get charge point detail response.\n{r.status_code}\n{r.text}"
         )
         json_data = await self._check_api_response(r)
-
-        return EvnexV3APIResponse[EvnexChargePointDetailV3].model_validate(json_data)
+        return json_data
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException, ReadTimeout)),
     )
-    async def get_charge_point_solar_config(
-        self, charge_point_id: str
-    ) -> EvnexChargePointSolarConfig:
+    async def get_charge_point_solar_config(self, charge_point_id: str):
         """
         :param charge_point_id:
         :raises: ReadTimeout if the charge point is offline.
@@ -256,20 +228,14 @@ class Evnex:
             headers=self._common_headers,
         )
         json_data = await self._check_api_response(r)
-
-        return EvnexChargePointSolarConfig.model_validate(json_data)
+        return json_data
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type(
-            (ValidationError, NotAuthorizedException, ReadTimeout)
-        ),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException, ReadTimeout)),
     )
-    async def get_charge_point_override(
-        self, charge_point_id: str
-    ) -> EvnexChargePointOverrideConfig:
+    async def get_charge_point_override(self, charge_point_id: str):
         """
-
         :param charge_point_id:
         :raises: ReadTimeout if the charge point is offline.
         """
@@ -279,15 +245,13 @@ class Evnex:
             timeout=15,
         )
         json_data = await self._check_api_response(r)
-        return EvnexChargePointOverrideConfig.model_validate(json_data)
+        return json_data
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException)),
     )
-    async def set_charge_point_override(
-        self, charge_point_id: str, charge_now: bool, connector_id: int = 1
-    ):
+    async def set_charge_point_override(self, charge_point_id: str, charge_now: bool, connector_id: int = 1):
         r = await self.httpx_client.post(
             f"https://client-api.evnex.io/v3/charge-points/{charge_point_id}/commands/set-override",
             headers=self._common_headers,
@@ -298,54 +262,38 @@ class Evnex:
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException)),
     )
-    async def get_charge_point_transactions(
-        self, charge_point_id: str
-    ) -> list[EvnexChargePointTransaction]:
+    async def get_charge_point_transactions(self, charge_point_id: str):
         warn(
             "This method is deprecated. See get_charge_point_sessions",
             DeprecationWarning,
             stacklevel=2,
         )
-        # Similar to f'https://client-api.evnex.io/v3/charge-points/{charge_point_id}/sessions',
-
         r = await self.httpx_client.get(
             f"https://client-api.evnex.io/v2/apps/charge-points/{charge_point_id}/transactions",
             headers=self._common_headers,
         )
         json_data = await self._check_api_response(r)
-        return EvnexGetChargePointTransactionsResponse.model_validate(
-            json_data
-        ).data.items
+        return json_data['data']['items']
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type((ValidationError, NotAuthorizedException)),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException)),
     )
-    async def get_charge_point_sessions(
-        self, charge_point_id: str
-    ) -> list[EvnexChargePointSession]:
+    async def get_charge_point_sessions(self, charge_point_id: str):
         r = await self.httpx_client.get(
             f"https://client-api.evnex.io/v3/charge-points/{charge_point_id}/sessions",
             headers=self._common_headers,
         )
         json_data = await self._check_api_response(r)
-        return EvnexGetChargePointSessionsResponse.model_validate(json_data).data
+        return json_data['data']
 
     @retry(
         wait=wait_random_exponential(multiplier=1, max=60),
-        retry=retry_if_not_exception_type(
-            (ValidationError, NotAuthorizedException, ReadTimeout)
-        ),
+        retry=retry_if_not_exception_type((ValueError, NotAuthorizedException, ReadTimeout)),
     )
-    async def stop_charge_point(
-        self,
-        charge_point_id: str,
-        org_id: Optional[str] = None,
-        connector_id: str = "1",
-        timeout=10,
-    ) -> EvnexCommandResponse:
+    async def stop_charge_point(self, charge_point_id: str, org_id: Optional[str] = None, connector_id: str = "1", timeout=10):
         """
         Stop an active charging session.
 
@@ -362,31 +310,23 @@ class Evnex:
         r = await self.httpx_client.post(
             f"https://client-api.evnex.io/v2/apps/organisations/{org_id}/charge-points/{charge_point_id}/commands/remote-stop-transaction",
             headers=self._common_headers,
-            # 'Connection': 'Keep-Alive'
             json={"connectorId": connector_id},
             timeout=timeout,
         )
         json_data = await self._check_api_response(r)
+        return json_data
 
-        return EvnexCommandResponse.model_validate(json_data["data"])
-
-    async def enable_charger(self, charge_point_id: str, connector_id: int | str = 1):
+    async def enable_charger(self, charge_point_id: str, connector_id: Union[int, str] = 1):
         await self.set_charger_availability(
             charge_point_id=charge_point_id, available=True, connector_id=connector_id
         )
 
-    async def disable_charger(self, charge_point_id: str, connector_id: int | str = 1):
+    async def disable_charger(self, charge_point_id: str, connector_id: Union[int, str] = 1):
         await self.set_charger_availability(
             charge_point_id=charge_point_id, available=False, connector_id=connector_id
         )
 
-    async def set_charger_availability(
-        self,
-        charge_point_id: str,
-        available: bool = True,
-        connector_id: int | str = 1,
-        timeout=10,
-    ) -> EvnexCommandResponse:
+    async def set_charger_availability(self, charge_point_id: str, available: bool = True, connector_id: Union[int, str] = 1, timeout=10):
         """
         Change availability of charger.
 
@@ -405,16 +345,9 @@ class Evnex:
             timeout=timeout,
         )
         json_data = await self._check_api_response(r)
+        return json_data
 
-        return EvnexCommandResponseV3.model_validate(json_data["data"])
-
-    async def unlock_charger(
-        self,
-        charge_point_id: str,
-        available: bool = True,
-        connector_id: str = "0",
-        timeout=10,
-    ) -> EvnexCommandResponse:
+    async def unlock_charger(self, charge_point_id: str, available: bool = True, connector_id: str = "0", timeout=10):
         """
         Unlock charger.
 
@@ -434,17 +367,9 @@ class Evnex:
             timeout=timeout,
         )
         json_data = await self._check_api_response(r)
-        return EvnexCommandResponse.model_validate(json_data["data"])
+        return json_data
 
-    async def set_charger_load_profile(
-        self,
-        charge_point_id: str,
-        charging_profile_periods: list[EvnexChargeProfileSegment | dict[str, int]],
-        enabled: bool = True,
-        duration: int = 86400,
-        units: str = "A",
-        timeout=10,
-    ) -> EvnexChargePointLoadSchedule:
+    async def set_charger_load_profile(self, charge_point_id: str, charging_profile_periods: List[Union[dict, "EvnexChargeProfileSegment"]], enabled: bool = True, duration: int = 86400, units: str = "A", timeout=10):
         """
         Set a load management profile for the charger.
 
@@ -453,10 +378,8 @@ class Evnex:
         logger.info("Applying load management profile")
         # Parse and validate the input
         schedule = [
-            segment.dict()
-            for segment in pydantic.parse_obj_as(
-                list[EvnexChargeProfileSegment], charging_profile_periods
-            )
+            segment if isinstance(segment, dict) else segment.dict()
+            for segment in charging_profile_periods
         ]
 
         r = await self.httpx_client.put(
@@ -471,16 +394,9 @@ class Evnex:
             timeout=timeout,
         )
         json_data = await self._check_api_response(r)
-        return EvnexChargePointLoadSchedule.model_validate(json_data["data"])
+        return json_data
 
-    async def set_charge_point_schedule(
-        self,
-        charge_point_id: str,
-        charging_profile_periods: list[EvnexChargeProfileSegment | dict[str, int]],
-        enabled: bool = True,
-        duration: int = 86400,
-        timeout=10,
-    ) -> EvnexChargePointLoadSchedule:
+    async def set_charge_point_schedule(self, charge_point_id: str, charging_profile_periods: List[Union[dict, "EvnexChargeProfileSegment"]], enabled: bool = True, duration: int = 86400, timeout=10):
         """
         Configure times that a charge point will charge between.
         Defaults to setting a daily period. Specify segments using seconds from midnight (using configured timezone).
@@ -494,10 +410,8 @@ class Evnex:
         logger.info("Applying load management profile")
         # Parse and validate the input
         schedule = [
-            segment.dict()
-            for segment in pydantic.parse_obj_as(
-                list[EvnexChargeProfileSegment], charging_profile_periods
-            )
+            segment if isinstance(segment, dict) else segment.dict()
+            for segment in charging_profile_periods
         ]
 
         r = await self.httpx_client.put(
@@ -506,11 +420,9 @@ class Evnex:
             json={
                 "chargingProfilePeriods": schedule,
                 "enabled": enabled,
-                # "units": "A",
                 "duration": duration,
-                # "timezone": timezone,
             },
             timeout=timeout,
         )
         json_data = await self._check_api_response(r)
-        return EvnexChargePointLoadSchedule.model_validate(json_data["data"])
+        return json_data
