@@ -37,7 +37,7 @@ from evnex.schema.v3.commands import EvnexCommandResponse as EvnexCommandRespons
 from evnex.schema.v3.generic import EvnexV3APIResponse
 from pydantic_settings import BaseSettings
 
-from schema.org import EvnexOrgSummaryStatus
+from evnex.schema.org import EvnexOrgSummaryStatus
 
 logger = logging.getLogger("evnex.api")
 
